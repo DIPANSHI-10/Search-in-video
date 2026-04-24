@@ -1,0 +1,13 @@
+openai-whisper
+numpy
+faiss-cpu
+sentence-transformers
+transformers
+torch
+ffmpeg-python
+streamlit
+requests
+beautifulsoup4
+Pillow
+matplotlib
+scipy
