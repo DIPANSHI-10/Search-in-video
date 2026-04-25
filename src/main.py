@@ -260,10 +260,7 @@ def load_cached_model(backend_name: Optional[str] = None):
 
 
 def create_embeddings(segments):
-    # Detect emotions for all segments first
-    segments = detect_all_segment_emotions(segments)
-    
-    # Create text embeddings
+    # Create text embeddings (emotion detection is handled separately after this)
     model = load_text_encoder()
     texts = [segment["text"] for segment in segments]
     embeddings = model.encode(texts, convert_to_tensor=False)
@@ -287,8 +284,60 @@ def normalize_embeddings(embeddings: np.ndarray):
     return embeddings / np.clip(norms, 1e-10, None)
 
 
-EMOTION_LABELS = ["happy", "sad", "fear", "disgust", "awful"]
-EMOTION_THRESHOLD = 0.45
+EMOTION_LABELS = [
+    "happy", "sad", "angry", "fearful", "disgusted",
+    "surprised", "excited", "confused", "neutral",
+    "anxious", "hopeful", "frustrated", "amused",
+    "nostalgic", "grateful", "proud", "jealous",
+    "embarrassed", "lonely", "calm",
+]
+EMOTION_THRESHOLD = 0.25  # Lowered for better recall with zero-shot classification
+
+# Maps user-friendly synonyms/aliases to the canonical emotion labels used internally
+EMOTION_SYNONYMS = {
+    "happiness": "happy", "joy": "happy", "joyful": "happy", "cheerful": "happy",
+    "delighted": "happy", "pleased": "happy", "glad": "happy",
+    "sadness": "sad", "unhappy": "sad", "sorrowful": "sad", "depressed": "sad",
+    "melancholy": "sad", "grief": "sad", "heartbroken": "sad",
+    "anger": "angry", "mad": "angry", "furious": "angry", "rage": "angry",
+    "irritated": "angry", "annoyed": "angry", "outraged": "angry",
+    "fear": "fearful", "scared": "fearful", "afraid": "fearful",
+    "terrified": "fearful", "frightened": "fearful", "horror": "fearful",
+    "disgust": "disgusted", "revolted": "disgusted", "repulsed": "disgusted",
+    "awful": "disgusted", "gross": "disgusted",
+    "surprise": "surprised", "shocked": "surprised", "astonished": "surprised",
+    "amazed": "surprised", "startled": "surprised",
+    "excitement": "excited", "thrilled": "excited", "enthusiastic": "excited",
+    "eager": "excited", "pumped": "excited",
+    "confusion": "confused", "puzzled": "confused", "bewildered": "confused",
+    "perplexed": "confused", "lost": "confused",
+    "anxiety": "anxious", "nervous": "anxious", "worried": "anxious",
+    "uneasy": "anxious", "tense": "anxious", "stressed": "anxious",
+    "hope": "hopeful", "optimistic": "hopeful",
+    "frustration": "frustrated", "annoyed": "frustrated",
+    "amusement": "amused", "entertained": "amused", "funny": "amused",
+    "humor": "amused", "humorous": "amused",
+    "nostalgia": "nostalgic", "sentimental": "nostalgic",
+    "gratitude": "grateful", "thankful": "grateful",
+    "pride": "proud", "accomplished": "proud",
+    "jealousy": "jealous", "envious": "jealous", "envy": "jealous",
+    "embarrassment": "embarrassed", "ashamed": "embarrassed", "shame": "embarrassed",
+    "loneliness": "lonely", "isolated": "lonely", "alone": "lonely",
+    "calmness": "calm", "peaceful": "calm", "serene": "calm", "relaxed": "calm",
+}
+
+
+def resolve_emotion_query(query: str) -> str:
+    """Resolve a user emotion query to the canonical emotion label."""
+    q = query.lower().strip()
+    # Direct match first
+    if q in EMOTION_LABELS:
+        return q
+    # Synonym lookup
+    if q in EMOTION_SYNONYMS:
+        return EMOTION_SYNONYMS[q]
+    # Return as-is (the zero-shot classifier can handle arbitrary labels)
+    return q
 
 
 def find_segments(query: str, segments):
@@ -302,23 +351,28 @@ def find_segments(query: str, segments):
     ]
 
 
-def detect_emotion(query: str, model):
-    if model is None:
-        return None, 0.0
+def detect_emotion(query: str, model=None):
+    """Detect the dominant emotion in a query using the zero-shot classifier."""
     if not query.strip():
         return None, 0.0
 
-    query_vec = model.encode([query], convert_to_tensor=False)
-    label_vecs = model.encode(EMOTION_LABELS, convert_to_tensor=False)
-    query_vec = np.asarray(query_vec, dtype=np.float32)
-    label_vecs = np.asarray(label_vecs, dtype=np.float32)
+    classifier = load_emotion_classifier()
+    if classifier is None:
+        return None, 0.0
 
-    query_norm = query_vec / np.clip(np.linalg.norm(query_vec, axis=1, keepdims=True), 1e-10, None)
-    label_norm = label_vecs / np.clip(np.linalg.norm(label_vecs, axis=1, keepdims=True), 1e-10, None)
+    try:
+        result = classifier(
+            query[:512],
+            EMOTION_LABELS,
+            hypothesis_template="This text expresses {} emotion.",
+            multi_label=False,
+        )
+        if result and "labels" in result and "scores" in result:
+            return result["labels"][0], float(result["scores"][0])
+    except Exception as e:
+        print(f"Error detecting emotion: {e}")
 
-    scores = label_norm.dot(query_norm.T).flatten()
-    best_index = int(np.argmax(scores))
-    return EMOTION_LABELS[best_index], float(scores[best_index])
+    return None, 0.0
 
 
 def find_emotional_segments(emotion: str, segments, model, top_k: int = DEFAULT_TOP_K):
@@ -346,16 +400,24 @@ def find_emotional_segments(emotion: str, segments, model, top_k: int = DEFAULT_
 
 
 def classify_segment_emotions(text: str):
-    """Classify emotions in a text segment using zero-shot classification."""
+    """Classify emotions in a text segment using zero-shot classification.
+    
+    Uses hypothesis_template to frame the classification as an emotion detection
+    task rather than generic NLI, which dramatically improves accuracy.
+    """
     classifier = load_emotion_classifier()
     if classifier is None:
         return {}
+    if not text or not text.strip():
+        return {}
     try:
-        # Define emotion candidates
-        candidate_emotions = ["happy", "sad", "angry", "scared", "excited", "confused", "neutral", "disgusted", "surprised"]
-        
-        # Run zero-shot classification
-        result = classifier(text[:512], candidate_emotions)  # Limit to 512 chars
+        # Use the full canonical emotion label set
+        result = classifier(
+            text[:512],
+            EMOTION_LABELS,
+            hypothesis_template="The speaker is feeling {}.",
+            multi_label=True,
+        )
         
         # Convert to emotion scores
         emotion_scores = {}
@@ -394,38 +456,48 @@ def detect_all_segment_emotions(segments):
 
 
 def find_segments_by_emotion_classifier(target_emotion: str, segments, top_k: int = DEFAULT_TOP_K):
-    """Find segments that match target emotion using pre-trained classifier."""
+    """Find segments that match target emotion using pre-trained classifier.
+    
+    Uses synonym resolution so user can search for "scared", "fear", "frightened"
+    etc. and they all map to the canonical label used during indexing.
+    Falls back to direct zero-shot re-classification when the canonical label
+    is not found in cached emotions (e.g. user types a novel emotion word).
+    """
     classifier = load_emotion_classifier()
     if classifier is None:
         return []
     
-    target_emotion_lower = target_emotion.lower().strip()
+    # Resolve the user query to the canonical label
+    canonical_emotion = resolve_emotion_query(target_emotion)
     scored_segments = []
     
-    # Check each segment's detected emotions
     for segment in segments:
         emotions = segment.get("emotions", {})
         
-        # Direct match: look for exact emotion in detected emotions
-        if target_emotion_lower in emotions:
-            score = emotions[target_emotion_lower]
+        if canonical_emotion in emotions:
+            # Fast path: use pre-computed score
+            score = emotions[canonical_emotion]
         else:
-            # Fallback: run zero-shot classification on the segment text for this specific emotion
+            # Slow path: the user asked for an emotion not in the canonical set,
+            # so run zero-shot on-demand for this specific label.
             try:
-                result = classifier(segment.get("text", "")[:512], [target_emotion_lower])
-                if "scores" in result and len(result["scores"]) > 0:
-                    score = float(result["scores"][0])
-                else:
-                    score = 0.0
+                result = classifier(
+                    segment.get("text", "")[:512],
+                    [canonical_emotion],
+                    hypothesis_template="The speaker is feeling {}.",
+                    multi_label=True,
+                )
+                score = float(result["scores"][0]) if result.get("scores") else 0.0
             except Exception:
                 score = 0.0
         
-        if score > 0.0:  # Only include segments with detected emotion
-            scored_segments.append({**segment, "emotion_score": score})
+        scored_segments.append({**segment, "emotion_score": score})
     
-    # Sort by emotion score and return top_k
+    # Sort by emotion score descending and return top_k
     sorted_segments = sorted(scored_segments, key=lambda x: x.get("emotion_score", 0.0), reverse=True)
-    return sorted_segments[:top_k]
+    # Only return segments above threshold
+    filtered = [s for s in sorted_segments if s.get("emotion_score", 0.0) >= EMOTION_THRESHOLD]
+    return filtered[:top_k] if filtered else sorted_segments[:top_k]
 
 
 def search_segments(query: str, embeddings, model, segments, top_k: int = DEFAULT_TOP_K):
